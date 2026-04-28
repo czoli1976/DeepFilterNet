@@ -28,11 +28,10 @@ panic = "abort"
 
 # Patched tract-linalg with the WASM SIMD kernel kit:
 #   wasm_f32_4x4 (existing) + wasm_f32_4x1 / 8x1 / 16x1 (new GEMV variants)
-#   + wasm_f32_8x4 / 8x8 (new MM variants) + per-M dispatcher in Ops::mmv_f32.
+#   + wasm_f32_8x8 (new MM variant) + per-M dispatcher in Ops::mmv_f32.
 # Cumulative impact on DFN3: RTF 0.1290 -> 0.0516 (-60%, 2.5x faster), bit-identical audio.
 # Source:   https://github.com/czoli1976/tract/tree/add-wasm-f32-full-kernel-kit
-# Tracking: czoli1976/tract#2 (full kit), czoli1976/tract#1 (upstream-PR-ready 4x1 only),
-#           sonos/tract#2161 (upstream issue).
+# Tracking: czoli1976/tract#2 (kernel kit), sonos/tract#2161 (upstream issue).
 [patch.crates-io]
 tract-linalg = { git = "https://github.com/czoli1976/tract", branch = "add-wasm-f32-full-kernel-kit" }
 
