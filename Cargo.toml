@@ -25,3 +25,12 @@ debug = false
 lto = "fat"
 strip = true
 panic = "abort"
+
+# Local patched tract-linalg with wasm_f32_4x1 GEMV kernel.
+# Adds a 4-row × 1-col SIMD kernel handling N=1 matrix-vector ops without the
+# 75% column-tile waste of the existing wasm_f32_4x4. Source at
+# /Users/CZoli/Desktop/tract-fork/tract-linalg-0.22.1/src/wasm.rs.
+[patch.crates-io]
+tract-linalg = { path = "/Users/CZoli/Desktop/tract-fork/tract-linalg-0.22.1" }
+
+
