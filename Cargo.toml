@@ -33,6 +33,6 @@ panic = "abort"
 # Source:   https://github.com/czoli1976/tract/tree/add-wasm-f32-full-kernel-kit
 # Tracking: czoli1976/tract#2 (kernel kit), sonos/tract#2161 (upstream issue).
 [patch.crates-io]
-tract-linalg = { git = "https://github.com/czoli1976/tract", rev = "b82d1f0" }
+tract-linalg = { git = "https://github.com/czoli1976/tract", rev = "d925624" }
 
 
