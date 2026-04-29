@@ -7,9 +7,14 @@
 /// > export CARGO_TARGET_WASM32_WASI_RUNNER=wasmtime
 /// > cargo test --target=wasm32-wasi
 /// ```
+pub mod sigmoid;
+
+use crate::frame::element_wise::ElementWiseKer;
 use crate::mmm::FusedKerSpec;
 use crate::mmm::ImplementationQuality;
 use crate::{Ops, Scaler};
+
+use self::sigmoid::WSigmoid4;
 
 pub fn plug(ops: &mut Ops) {
     ops.mmm_impls.push(wasm_f32_4x4.mmm());
@@ -26,6 +31,10 @@ pub fn plug(ops: &mut Ops) {
         8..=15 => wasm_f32_8x1.mmm(),
         _ => wasm_f32_16x1.mmm(),
     });
+    // WASM SIMD128 sigmoid kernel — bit-identical replacement for the
+    // scalar generic::SSigmoid4. Mirrors the arm64 / x86_64-fma wiring.
+    ops.sigmoid_f32 = Box::new(|| WSigmoid4::ew());
+    log::info!("wasm32 simd128 sigmoid_f32 activated");
 }
 
 unsafe fn kernel_f32_4x4(mut pnl: *const FusedKerSpec<f32>) -> isize {
