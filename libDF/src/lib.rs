@@ -282,16 +282,77 @@ pub fn compute_band_corr(out: &mut [f32], x: &[Complex32], p: &[Complex32], erb_
         *y = 0.0;
     }
     debug_assert_eq!(erb_fb.len(), out.len());
+    debug_assert_eq!(x.len(), p.len());
 
-    let mut bcsum = 0;
+    // Each Complex32 occupies 2 contiguous f32 (re, im). Reinterpret the slices
+    // as flat &[f32] of length 2*N so we can vectorize with f32x4 loads.
+    // SAFETY: Complex32 is #[repr(C)] { re: f32, im: f32 } -> 8 bytes, alignment 4,
+    // identical to two contiguous f32. Length is exactly 2 * x.len().
+    let xf: &[f32] =
+        unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f32, x.len() * 2) };
+    let pf: &[f32] =
+        unsafe { core::slice::from_raw_parts(p.as_ptr() as *const f32, p.len() * 2) };
+
+    let mut bcsum = 0usize;
     for (&band_size, out_b) in erb_fb.iter().zip(out.iter_mut()) {
-        let k = 1. / band_size as f32;
-        for j in 0..band_size {
-            let idx = bcsum + j;
-            *out_b += (x[idx].re * p[idx].re + x[idx].im * p[idx].im) * k;
-        }
+        let k = 1.0f32 / band_size as f32;
+        let f_start = bcsum * 2;
+        let f_len = band_size * 2;
+        let xb = &xf[f_start..f_start + f_len];
+        let pb = &pf[f_start..f_start + f_len];
+        // sum := sum over band of x[i].re*p[i].re + x[i].im*p[i].im
+        // == sum over flattened pairs of xb[2j]*pb[2j] + xb[2j+1]*pb[2j+1]
+        // == sum_lanes( sum over 4-wide chunks of xb[..]*pb[..] )
+        let sum: f32 = compute_band_corr_inner(xb, pb);
+        *out_b = sum * k;
         bcsum += band_size;
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn compute_band_corr_inner(xb: &[f32], pb: &[f32]) -> f32 {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(xb.len(), pb.len());
+    let n = xb.len();
+    let n4 = n & !3; // round down to multiple of 4
+    let mut acc = f32x4_splat(0.0);
+    let xp = xb.as_ptr();
+    let pp = pb.as_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        // SAFETY: xp/pp are aligned to f32 (4 bytes); v128_load uses unaligned semantics.
+        // We bounds-check via i < n4 <= n == xb.len() == pb.len().
+        unsafe {
+            let xv = v128_load(xp.add(i) as *const v128);
+            let pv = v128_load(pp.add(i) as *const v128);
+            let prod = f32x4_mul(xv, pv);
+            acc = f32x4_add(acc, prod);
+        }
+        i += 4;
+    }
+    // Horizontal reduce the 4 lanes.
+    let mut sum = f32x4_extract_lane::<0>(acc)
+        + f32x4_extract_lane::<1>(acc)
+        + f32x4_extract_lane::<2>(acc)
+        + f32x4_extract_lane::<3>(acc);
+    // Tail: 0..3 leftover f32 (i.e. 0 or 1 trailing complex pair if band_size is odd).
+    while i < n {
+        sum += unsafe { *xp.add(i) * *pp.add(i) };
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn compute_band_corr_inner(xb: &[f32], pb: &[f32]) -> f32 {
+    debug_assert_eq!(xb.len(), pb.len());
+    let mut sum = 0.0f32;
+    for (a, b) in xb.iter().zip(pb.iter()) {
+        sum += a * b;
+    }
+    sum
 }
 
 pub fn band_compr(out: &mut [f32], x: &[f32], erb_fb: &[usize]) {
