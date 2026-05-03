@@ -250,10 +250,7 @@ pub fn band_mean_norm_erb(xs: &mut [f32], state: &mut [f32], alpha: f32) {
 
 pub fn band_unit_norm(xs: &mut [Complex32], state: &mut [f32], alpha: f32) {
     debug_assert_eq!(xs.len(), state.len());
-    for (x, s) in xs.iter_mut().zip(state.iter_mut()) {
-        *s = x.norm() * (1. - alpha) + *s * alpha;
-        *x /= s.sqrt();
-    }
+    band_unit_norm_inner(xs, state, alpha);
 }
 
 /// Band unit norm, but with transposed output type. I.e. out contains first all real elements,
@@ -263,16 +260,7 @@ pub fn band_unit_norm_t(xs: &[Complex32], state: &mut [f32], alpha: f32, out: &m
     debug_assert_eq!(xs.len(), state.len());
     debug_assert_eq!(xs.len(), out.len() / 2);
     let (o_re, o_im) = out.split_at_mut(xs.len());
-    for (x, s, o_re, o_im) in izip!(
-        xs.iter(),
-        state.iter_mut(),
-        o_re.iter_mut(),
-        o_im.iter_mut(),
-    ) {
-        *s = x.norm() * (1. - alpha) + *s * alpha;
-        *o_re /= s.sqrt();
-        *o_im /= s.sqrt();
-    }
+    band_unit_norm_t_inner(xs, state, alpha, o_re, o_im);
 }
 
 pub fn compute_band_corr(out: &mut [f32], x: &[Complex32], p: &[Complex32], erb_fb: &[usize]) {
@@ -468,6 +456,162 @@ fn f32_mul_inplace(xs: &mut [f32], ws: &[f32]) {
     debug_assert_eq!(xs.len(), ws.len());
     for (x, &w) in xs.iter_mut().zip(ws.iter()) {
         *x *= w;
+    }
+}
+
+// IIR per-bin unit-norm on interleaved Complex32:
+//   state[i] = sqrt(re[i]^2 + im[i]^2) * (1 - α) + state[i] * α;
+//   xs[i] /= sqrt(state[i])      (Complex32 / f32 = each component / f32)
+//
+// SIMD path processes 4 Complex32 per iteration. The interleaved layout
+// [re0,im0,re1,im1,re2,im2,re3,im3] is loaded as two v128s, de-interleaved
+// via i32x4_shuffle into pure-real and pure-imag vectors so the norm can be
+// computed lane-wise. The normalisation step then divides each Complex32
+// component by sqrt(state[i]) by re-interleaving the divisor.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn band_unit_norm_inner(xs: &mut [Complex32], state: &mut [f32], alpha: f32) {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(xs.len(), state.len());
+    let n = xs.len();
+    let n4 = n & !3;
+    let one_minus_a = f32x4_splat(1.0 - alpha);
+    let alpha_v = f32x4_splat(alpha);
+    let xf = xs.as_mut_ptr() as *mut f32;
+    let sp = state.as_mut_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        // SAFETY: i < n4 <= n, and Complex32 is #[repr(C)] {re: f32, im: f32},
+        // so xs as &mut [f32] of length 2N is valid. v128_load is unaligned.
+        unsafe {
+            let lo = v128_load(xf.add(i * 2) as *const v128);
+            let hi = v128_load(xf.add(i * 2 + 4) as *const v128);
+            // De-interleave: re_v = [re0, re1, re2, re3], im_v = [im0, im1, im2, im3]
+            let re_v = i32x4_shuffle::<0, 2, 4, 6>(lo, hi);
+            let im_v = i32x4_shuffle::<1, 3, 5, 7>(lo, hi);
+            // norm = sqrt(re² + im²) (note: this is (re²+im²).sqrt(), not libm hypot)
+            let norm_sq = f32x4_add(f32x4_mul(re_v, re_v), f32x4_mul(im_v, im_v));
+            let norm_v = f32x4_sqrt(norm_sq);
+            // state update
+            let sv = v128_load(sp.add(i) as *const v128);
+            let new_s = f32x4_add(f32x4_mul(norm_v, one_minus_a), f32x4_mul(sv, alpha_v));
+            v128_store(sp.add(i) as *mut v128, new_s);
+            // xs /= sqrt(state): build duplicated divisor per Complex32
+            //   for lo: [sqrt_s0, sqrt_s0, sqrt_s1, sqrt_s1]
+            //   for hi: [sqrt_s2, sqrt_s2, sqrt_s3, sqrt_s3]
+            let sqrt_s = f32x4_sqrt(new_s);
+            let div_lo = i32x4_shuffle::<0, 0, 1, 1>(sqrt_s, sqrt_s);
+            let div_hi = i32x4_shuffle::<2, 2, 3, 3>(sqrt_s, sqrt_s);
+            v128_store(xf.add(i * 2) as *mut v128, f32x4_div(lo, div_lo));
+            v128_store(xf.add(i * 2 + 4) as *mut v128, f32x4_div(hi, div_hi));
+        }
+        i += 4;
+    }
+    // Tail: 0..3 trailing Complex32. Use the SAME (re²+im²).sqrt() as the SIMD
+    // path (NOT Complex32::norm() which is libm hypot) so vectorised + tail
+    // produce identical results across the full length.
+    while i < n {
+        unsafe {
+            let xi_re = *xf.add(i * 2);
+            let xi_im = *xf.add(i * 2 + 1);
+            let norm = (xi_re * xi_re + xi_im * xi_im).sqrt();
+            let new_s = norm * (1.0 - alpha) + *sp.add(i) * alpha;
+            *sp.add(i) = new_s;
+            let sqrt_s = new_s.sqrt();
+            *xf.add(i * 2) = xi_re / sqrt_s;
+            *xf.add(i * 2 + 1) = xi_im / sqrt_s;
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn band_unit_norm_inner(xs: &mut [Complex32], state: &mut [f32], alpha: f32) {
+    for (x, s) in xs.iter_mut().zip(state.iter_mut()) {
+        *s = x.norm() * (1. - alpha) + *s * alpha;
+        *x /= s.sqrt();
+    }
+}
+
+// Same IIR norm as band_unit_norm but writes to o_re / o_im split halves of
+// the output (xs read-only). The output halves are CONTIGUOUS so no
+// re-interleave step is needed for the divide — simpler than band_unit_norm.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn band_unit_norm_t_inner(
+    xs: &[Complex32],
+    state: &mut [f32],
+    alpha: f32,
+    o_re: &mut [f32],
+    o_im: &mut [f32],
+) {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(xs.len(), state.len());
+    debug_assert_eq!(xs.len(), o_re.len());
+    debug_assert_eq!(xs.len(), o_im.len());
+    let n = xs.len();
+    let n4 = n & !3;
+    let one_minus_a = f32x4_splat(1.0 - alpha);
+    let alpha_v = f32x4_splat(alpha);
+    let xf = xs.as_ptr() as *const f32;
+    let sp = state.as_mut_ptr();
+    let rp = o_re.as_mut_ptr();
+    let ip = o_im.as_mut_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        unsafe {
+            let lo = v128_load(xf.add(i * 2) as *const v128);
+            let hi = v128_load(xf.add(i * 2 + 4) as *const v128);
+            let re_v = i32x4_shuffle::<0, 2, 4, 6>(lo, hi);
+            let im_v = i32x4_shuffle::<1, 3, 5, 7>(lo, hi);
+            let norm_sq = f32x4_add(f32x4_mul(re_v, re_v), f32x4_mul(im_v, im_v));
+            let norm_v = f32x4_sqrt(norm_sq);
+            let sv = v128_load(sp.add(i) as *const v128);
+            let new_s = f32x4_add(f32x4_mul(norm_v, one_minus_a), f32x4_mul(sv, alpha_v));
+            v128_store(sp.add(i) as *mut v128, new_s);
+            let sqrt_s = f32x4_sqrt(new_s);
+            // o_re / o_im are stored contiguously, divide directly
+            let or_v = v128_load(rp.add(i) as *const v128);
+            let oi_v = v128_load(ip.add(i) as *const v128);
+            v128_store(rp.add(i) as *mut v128, f32x4_div(or_v, sqrt_s));
+            v128_store(ip.add(i) as *mut v128, f32x4_div(oi_v, sqrt_s));
+        }
+        i += 4;
+    }
+    while i < n {
+        unsafe {
+            let xi_re = *xf.add(i * 2);
+            let xi_im = *xf.add(i * 2 + 1);
+            let norm = (xi_re * xi_re + xi_im * xi_im).sqrt();
+            let new_s = norm * (1.0 - alpha) + *sp.add(i) * alpha;
+            *sp.add(i) = new_s;
+            let sqrt_s = new_s.sqrt();
+            *rp.add(i) /= sqrt_s;
+            *ip.add(i) /= sqrt_s;
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn band_unit_norm_t_inner(
+    xs: &[Complex32],
+    state: &mut [f32],
+    alpha: f32,
+    o_re: &mut [f32],
+    o_im: &mut [f32],
+) {
+    for (x, s, o_re, o_im) in izip!(
+        xs.iter(),
+        state.iter_mut(),
+        o_re.iter_mut(),
+        o_im.iter_mut(),
+    ) {
+        *s = x.norm() * (1. - alpha) + *s * alpha;
+        *o_re /= s.sqrt();
+        *o_im /= s.sqrt();
     }
 }
 
