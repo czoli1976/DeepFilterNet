@@ -221,7 +221,9 @@ impl DFState {
     }
 
     pub fn apply_mask(&self, output: &mut [Complex32], gains: &[f32]) {
-        apply_interp_band_gain(output, gains, &self.erb)
+        // apply_band_gain is the Complex32 specialisation of apply_interp_band_gain
+        // and carries a SIMD-vectorised inner loop on wasm32.
+        apply_band_gain(output, gains, &self.erb)
     }
 }
 
@@ -243,11 +245,7 @@ pub fn band_mean_norm_freq(xs: &[Complex32], xout: &mut [f32], state: &mut [f32]
 
 pub fn band_mean_norm_erb(xs: &mut [f32], state: &mut [f32], alpha: f32) {
     debug_assert_eq!(xs.len(), state.len());
-    for (x, s) in xs.iter_mut().zip(state.iter_mut()) {
-        *s = *x * (1. - alpha) + *s * alpha;
-        *x -= *s;
-        *x /= 40.;
-    }
+    band_mean_norm_erb_inner(xs, state, alpha);
 }
 
 pub fn band_unit_norm(xs: &mut [Complex32], state: &mut [f32], alpha: f32) {
@@ -355,6 +353,124 @@ fn compute_band_corr_inner(xb: &[f32], pb: &[f32]) -> f32 {
     sum
 }
 
+// Element-wise IIR mean-norm: state[i] = x[i]*(1-α) + state[i]*α; x[i] = (x[i] - state[i])/40.
+// Per-bin independent (no recurrence between bins) — straightforward SIMD.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn band_mean_norm_erb_inner(xs: &mut [f32], state: &mut [f32], alpha: f32) {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(xs.len(), state.len());
+    let n = xs.len();
+    let n4 = n & !3;
+    let one_minus_a = f32x4_splat(1.0 - alpha);
+    let alpha_v = f32x4_splat(alpha);
+    let inv40 = f32x4_splat(1.0 / 40.0);
+    let xp = xs.as_mut_ptr();
+    let sp = state.as_mut_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        // SAFETY: i < n4 <= n == xs.len() == state.len(). v128_load takes 16 bytes
+        // (4 f32). xp/sp are aligned to f32 (4 bytes); v128_load uses unaligned semantics.
+        unsafe {
+            let xv = v128_load(xp.add(i) as *const v128);
+            let sv = v128_load(sp.add(i) as *const v128);
+            let new_s = f32x4_add(f32x4_mul(xv, one_minus_a), f32x4_mul(sv, alpha_v));
+            v128_store(sp.add(i) as *mut v128, new_s);
+            let x_norm = f32x4_mul(f32x4_sub(xv, new_s), inv40);
+            v128_store(xp.add(i) as *mut v128, x_norm);
+        }
+        i += 4;
+    }
+    while i < n {
+        unsafe {
+            let new_s = *xp.add(i) * (1.0 - alpha) + *sp.add(i) * alpha;
+            *sp.add(i) = new_s;
+            *xp.add(i) = (*xp.add(i) - new_s) / 40.0;
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn band_mean_norm_erb_inner(xs: &mut [f32], state: &mut [f32], alpha: f32) {
+    debug_assert_eq!(xs.len(), state.len());
+    for (x, s) in xs.iter_mut().zip(state.iter_mut()) {
+        *s = *x * (1. - alpha) + *s * alpha;
+        *x -= *s;
+        *x /= 40.;
+    }
+}
+
+// Multiply every f32 lane in `xs` by scalar `k`, in place.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn f32_scale_inplace(xs: &mut [f32], k: f32) {
+    use core::arch::wasm32::*;
+    let n = xs.len();
+    let n4 = n & !3;
+    let kv = f32x4_splat(k);
+    let xp = xs.as_mut_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        unsafe {
+            let xv = v128_load(xp.add(i) as *const v128);
+            v128_store(xp.add(i) as *mut v128, f32x4_mul(xv, kv));
+        }
+        i += 4;
+    }
+    while i < n {
+        unsafe {
+            *xp.add(i) *= k;
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn f32_scale_inplace(xs: &mut [f32], k: f32) {
+    for x in xs.iter_mut() {
+        *x *= k;
+    }
+}
+
+// Element-wise multiply: xs[i] *= ws[i] for the whole slice, in place.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn f32_mul_inplace(xs: &mut [f32], ws: &[f32]) {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(xs.len(), ws.len());
+    let n = xs.len();
+    let n4 = n & !3;
+    let xp = xs.as_mut_ptr();
+    let wp = ws.as_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        unsafe {
+            let xv = v128_load(xp.add(i) as *const v128);
+            let wv = v128_load(wp.add(i) as *const v128);
+            v128_store(xp.add(i) as *mut v128, f32x4_mul(xv, wv));
+        }
+        i += 4;
+    }
+    while i < n {
+        unsafe {
+            *xp.add(i) *= *wp.add(i);
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn f32_mul_inplace(xs: &mut [f32], ws: &[f32]) {
+    debug_assert_eq!(xs.len(), ws.len());
+    for (x, &w) in xs.iter_mut().zip(ws.iter()) {
+        *x *= w;
+    }
+}
+
 pub fn band_compr(out: &mut [f32], x: &[f32], erb_fb: &[usize]) {
     for y in out.iter_mut() {
         *y = 0.0;
@@ -398,12 +514,18 @@ fn interp_band_gain(out: &mut [f32], band_e: &[f32], erb_fb: &[usize]) {
 }
 
 fn apply_band_gain(out: &mut [Complex32], band_e: &[f32], erb_fb: &[usize]) {
-    let mut bcsum = 0;
-    for (&band_size, b) in erb_fb.iter().zip(band_e.iter()) {
-        for j in 0..band_size {
-            let idx = bcsum + j;
-            out[idx] *= *b;
-        }
+    // Reinterpret &mut [Complex32] as &mut [f32] of length 2*N. Complex32 is
+    // #[repr(C)] { re: f32, im: f32 }: 8 bytes, alignment 4 — identical layout
+    // to two contiguous f32. Multiplying each Complex32 by a real f32 scalar `b`
+    // is equivalent to multiplying every f32 lane by `b`.
+    let n = out.len();
+    let outf: &mut [f32] =
+        unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, n * 2) };
+    let mut bcsum = 0usize;
+    for (&band_size, &b) in erb_fb.iter().zip(band_e.iter()) {
+        let f_start = bcsum * 2;
+        let f_len = band_size * 2;
+        f32_scale_inplace(&mut outf[f_start..f_start + f_len], b);
         bcsum += band_size;
     }
 }
@@ -495,13 +617,9 @@ fn apply_window(xs: &[f32], window: &[f32]) -> Vec<f32> {
     out
 }
 
-fn apply_window_in_place<'a, I>(xs: &mut [f32], window: I)
-where
-    I: IntoIterator<Item = &'a f32>,
-{
-    for (x, &w) in xs.iter_mut().zip(window) {
-        *x *= w;
-    }
+fn apply_window_in_place(xs: &mut [f32], window: &[f32]) {
+    debug_assert_eq!(xs.len(), window.len());
+    f32_mul_inplace(xs, window);
 }
 
 pub fn post_filter(noisy: &[Complex32], enh: &mut [Complex32], beta: f32) {
