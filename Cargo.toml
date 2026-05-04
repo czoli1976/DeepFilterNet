@@ -25,3 +25,15 @@ debug = false
 lto = "fat"
 strip = true
 panic = "abort"
+
+# Patched tract-linalg with the WASM SIMD kernel kit:
+#   wasm_f32_4x4 (existing) + wasm_f32_4x1 / 8x1 / 16x1 (new GEMV variants)
+#   + wasm_f32_8x8 (new MM variant) + per-M dispatcher in Ops::mmv_f32.
+# Cumulative impact on DFN3: RTF 0.1290 -> 0.0516 (-60%, 2.5x faster), bit-identical audio.
+# Source:   vendor/tract-linalg-0.22.1 (self-contained crate, version-matched 0.22.1).
+# Lineage:  cherry-picked from czoli1976/tract@kernel-kit-on-v0.22.1 — kernel kit
+#           from sonos/tract#2164 (merged) applied onto sonos/tract v0.22.1 tag.
+[patch.crates-io]
+tract-linalg = { path = "vendor/tract-linalg-0.22.1" }
+
+
