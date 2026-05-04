@@ -459,6 +459,81 @@ fn f32_mul_inplace(xs: &mut [f32], ws: &[f32]) {
     }
 }
 
+// Three-slice element-wise add: out[i] = a[i] + b[i].
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn f32_add_to(a: &[f32], b: &[f32], out: &mut [f32]) {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+    let n = a.len();
+    let n4 = n & !3;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    let op = out.as_mut_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        unsafe {
+            let av = v128_load(ap.add(i) as *const v128);
+            let bv = v128_load(bp.add(i) as *const v128);
+            v128_store(op.add(i) as *mut v128, f32x4_add(av, bv));
+        }
+        i += 4;
+    }
+    while i < n {
+        unsafe {
+            *op.add(i) = *ap.add(i) + *bp.add(i);
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn f32_add_to(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+    for ((&x, &y), o) in a.iter().zip(b.iter()).zip(out.iter_mut()) {
+        *o = x + y;
+    }
+}
+
+// In-place element-wise add: xs[i] += ys[i].
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn f32_add_inplace(xs: &mut [f32], ys: &[f32]) {
+    use core::arch::wasm32::*;
+    debug_assert_eq!(xs.len(), ys.len());
+    let n = xs.len();
+    let n4 = n & !3;
+    let xp = xs.as_mut_ptr();
+    let yp = ys.as_ptr();
+    let mut i = 0usize;
+    while i < n4 {
+        unsafe {
+            let xv = v128_load(xp.add(i) as *const v128);
+            let yv = v128_load(yp.add(i) as *const v128);
+            v128_store(xp.add(i) as *mut v128, f32x4_add(xv, yv));
+        }
+        i += 4;
+    }
+    while i < n {
+        unsafe {
+            *xp.add(i) += *yp.add(i);
+        }
+        i += 1;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn f32_add_inplace(xs: &mut [f32], ys: &[f32]) {
+    debug_assert_eq!(xs.len(), ys.len());
+    for (x, &y) in xs.iter_mut().zip(ys.iter()) {
+        *x += y;
+    }
+}
+
 // IIR per-bin unit-norm on interleaved Complex32:
 //   state[i] = sqrt(re[i]^2 + im[i]^2) * (1 - α) + state[i] * α;
 //   xs[i] /= sqrt(state[i])      (Complex32 / f32 = each component / f32)
@@ -732,10 +807,12 @@ fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFSt
     }
     apply_window_in_place(&mut x, &state.window);
     let (x_first, x_second) = x.split_at(state.frame_size);
-    for ((&xi, &mem), out) in x_first.iter().zip(state.synthesis_mem.iter()).zip(output.iter_mut())
-    {
-        *out = xi + mem;
-    }
+    // out[i] = x_first[i] + synthesis_mem[i] (zip-3 stops at shortest;
+    // x_first.len() == output.len() == frame_size; synthesis_mem may be longer).
+    let n_out = output.len();
+    debug_assert_eq!(x_first.len(), n_out);
+    debug_assert!(state.synthesis_mem.len() >= n_out);
+    f32_add_to(x_first, &state.synthesis_mem[..n_out], output);
 
     let split = state.synthesis_mem.len() - state.frame_size;
     if split > 0 {
@@ -743,14 +820,12 @@ fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFSt
     }
     let (s_first, s_second) = state.synthesis_mem.split_at_mut(split);
     let (xs_first, xs_second) = x_second.split_at(split);
-    for (&xi, mem) in xs_first.iter().zip(s_first.iter_mut()) {
-        // Overlap add for next frame
-        *mem += xi;
-    }
-    for (&xi, mem) in xs_second.iter().zip(s_second.iter_mut()) {
-        // Override left shifted buffer
-        *mem = xi;
-    }
+    // Overlap-add for next frame: s_first[i] += xs_first[i].
+    let n_first = xs_first.len().min(s_first.len());
+    f32_add_inplace(&mut s_first[..n_first], &xs_first[..n_first]);
+    // Override left-shifted buffer: s_second[i] = xs_second[i] (memcpy-shaped).
+    let n_second = xs_second.len().min(s_second.len());
+    s_second[..n_second].copy_from_slice(&xs_second[..n_second]);
 }
 
 fn apply_window(xs: &[f32], window: &[f32]) -> Vec<f32> {
