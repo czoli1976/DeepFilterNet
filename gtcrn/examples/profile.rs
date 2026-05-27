@@ -10,10 +10,13 @@ use tract_onnx::tract_core::plan::{eval as core_eval, TurnState};
 fn main() -> TractResult<()> {
     let bytes = include_bytes!("../models/gtcrn_simple.onnx");
     let mut cursor = std::io::Cursor::new(&bytes[..]);
-    let plan = tract_onnx::onnx()
-        .model_for_read(&mut cursor)?
-        .into_optimized()?
-        .into_runnable()?;
+    let mut typed = tract_onnx::onnx().model_for_read(&mut cursor)?.into_typed()?;
+    typed.declutter()?;
+    if std::env::var("GTCRN_NO_REWRITE").is_err() {
+        let n = gtcrn::rewrite::replace_const_scatternd(&mut typed)?;
+        eprintln!("rewrote {n} ScatterNd nodes");
+    }
+    let plan = typed.into_optimized()?.into_runnable()?;
     let mut state = TypedSimpleState::new(&plan)?;
 
     let mix = Tensor::zero::<f32>(&[1, 257, 1, 2])?;

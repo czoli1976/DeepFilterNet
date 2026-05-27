@@ -16,6 +16,8 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 use tract_onnx::prelude::*;
 
+pub mod rewrite;
+
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const N_FFT: usize = 512;
 pub const HOP: usize = 256;
@@ -120,10 +122,17 @@ impl GtcrnStream {
 
     pub fn from_onnx_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(bytes);
-        // `into_runnable` already yields an `Arc<RunnableModel>`.
-        let plan = tract_onnx::onnx()
+        let mut typed = tract_onnx::onnx()
             .model_for_read(&mut cursor)
             .context("Failed to parse GTCRN ONNX model")?
+            .into_typed()
+            .context("Failed to type GTCRN model")?;
+        typed.declutter().context("Failed to declutter GTCRN model")?;
+        let rewritten = rewrite::replace_const_scatternd(&mut typed)
+            .context("Failed to rewrite ScatterNd nodes")?;
+        log::debug!("Rewrote {rewritten} constant-index ScatterNd nodes");
+        // `into_runnable` already yields an `Arc<RunnableModel>`.
+        let plan = typed
             .into_optimized()
             .context("Failed to optimize GTCRN model")?
             .into_runnable()
