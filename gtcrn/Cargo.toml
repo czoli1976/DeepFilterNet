@@ -1,0 +1,30 @@
+[package]
+name = "gtcrn"
+version = "0.1.0"
+authors = ["DeepFilterNet contributors"]
+edition = "2021"
+description = "Streaming GTCRN speech enhancement inference in Rust (ONNX via tract)"
+license = "MIT/Apache-2.0"
+rust-version = "1.75"
+
+[lib]
+name = "gtcrn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gtcrn-enhance"
+path = "src/main.rs"
+required-features = ["bin"]
+
+[features]
+default = ["bin"]
+bin = ["dep:clap", "dep:hound", "dep:env_logger"]
+
+[dependencies]
+anyhow = "1.0"
+log = "0.4"
+realfft = "3.1"
+tract-onnx = { git = "https://github.com/sonos/tract", branch = "main" }
+clap = { version = "4.0", optional = true, features = ["derive"] }
+hound = { version = "3.5", optional = true }
+env_logger = { version = "0.11", optional = true }
